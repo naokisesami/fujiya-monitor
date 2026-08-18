@@ -10,12 +10,6 @@
 使い方:
   python fetch_listing.py "https://www.fujiya-avic.co.jp/shop/g/g240001179986/"
   もしくは環境変数 FUJIYA_URL に指定して実行（GitHub Actionsから利用する場合）
-
-注意:
-  フジヤエービックのページ構造が変わると、JANコード・ランク・特記事項の
-  抽出がずれる可能性があります（商品名・ブランド・価格・写真は構造化データ
-  から取得しているため比較的安定しています）。実際に何件か試して、
-  抽出結果がおかしい場合は教えてください。
 """
 
 import csv
@@ -24,10 +18,10 @@ import os
 import re
 import sys
 from datetime import datetime, timezone, timedelta
-from html import unescape
 from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 JST = timezone(timedelta(hours=9))
 HEADERS = {
@@ -37,11 +31,11 @@ HEADERS = {
     )
 }
 
-GOODS_DETAIL_RE = re.compile(r'name="etm:goods_detail"\s+content="([^"]+)"')
-JAN_RE = re.compile(r'JAN[コードCode]{0,4}[^0-9]{0,40}([0-9]{8,13})', re.S)
-RANK_RE = re.compile(r'中古[:：]\s*(未使用/未開封品|現状品|コレクション|AB\+|AB-|AB|A|B)')
-NOTE_RE = re.compile(r'特記事項[^<]{0,20}<[^>]*>\s*([^<\n]{1,200})', re.S)
 IMG_RE = re.compile(r'/img/goods/[^"\'\s]+?\.(?:jpg|jpeg|png)', re.I)
+JAN_RE = re.compile(r'JAN[コードCode]{0,4}\s*[:：]?\s*\n?\s*([0-9]{8,13})')
+
+# コンディション比較テーブルから拾いたい項目
+CONDITION_LABELS = ("ランク", "元箱", "中古保証期間", "特記事項", "欠品情報")
 
 
 def extract_goods_code(url):
@@ -53,33 +47,40 @@ def fetch_listing(url):
     res = requests.get(url, headers=HEADERS, timeout=20)
     res.raise_for_status()
     html = res.text
+    soup = BeautifulSoup(html, "html.parser")
 
+    # 1) 埋め込みの構造化データ（商品名・ブランド・価格・カテゴリ）
     data = {}
-    m = GOODS_DETAIL_RE.search(html)
-    if m:
+    meta_tag = soup.find("meta", attrs={"name": "etm:goods_detail"})
+    print(f"  [debug] goods_detail metaタグ検出: {bool(meta_tag)}")
+    if meta_tag and meta_tag.get("content"):
         try:
-            data = json.loads(unescape(m.group(1)))
-        except (json.JSONDecodeError, TypeError):
-            data = {}
+            data = json.loads(meta_tag["content"])
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"  [warn] goods_detail JSONの解析に失敗: {e}")
 
     goods_code = data.get("item_code") or extract_goods_code(url)
 
+    # 2) コンディション比較テーブル（ランク・元箱・特記事項・欠品情報など）
+    condition = {}
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            cells = tr.find_all(["th", "td"])
+            if len(cells) >= 2:
+                label = cells[0].get_text(strip=True)
+                value = cells[1].get_text(strip=True)
+                if label in CONDITION_LABELS:
+                    condition[label] = value
+    print(f"  [debug] コンディション表から取得した項目: {list(condition.keys())}")
+
+    # 3) JANコード（ページ全文テキストから）
+    page_text = soup.get_text("\n")
     jan = None
-    jm = JAN_RE.search(html)
+    jm = JAN_RE.search(page_text)
     if jm:
         jan = jm.group(1)
 
-    rank = None
-    rm = RANK_RE.search(html)
-    if rm:
-        rank = rm.group(1)
-
-    note = None
-    nm = NOTE_RE.search(html)
-    if nm:
-        note = nm.group(1).strip()
-
-    # 画像URL収集（メイン画像・詳細画像。重複除去して順序維持）
+    # 4) 画像URL収集（メイン画像・詳細画像。重複除去して順序維持）
     img_paths = list(dict.fromkeys(IMG_RE.findall(html)))
     image_urls = [f"https://www.fujiya-avic.co.jp{p}" for p in img_paths]
 
@@ -88,9 +89,11 @@ def fetch_listing(url):
         "name": data.get("name"),
         "brand": data.get("brand_name"),
         "price": data.get("price"),
-        "rank": rank,
+        "rank": condition.get("ランク"),
         "jan": jan,
-        "note": note,
+        "original_box": condition.get("元箱"),
+        "note": condition.get("特記事項"),
+        "missing_items": condition.get("欠品情報"),
         "category_name": data.get("category_name"),
         "url": url,
         "image_urls": image_urls,
@@ -122,7 +125,7 @@ def append_listing_csv(item, csv_path="listings.csv"):
     file_exists = os.path.exists(csv_path)
     fieldnames = [
         "取得日時", "商品コード", "商品名", "ブランド", "ランク", "JANコード",
-        "仕入れ価格(税込)", "カテゴリ", "特記事項", "フジヤURL",
+        "仕入れ価格(税込)", "カテゴリ", "元箱", "特記事項", "欠品情報", "フジヤURL",
         "eBayタイトル", "eBay価格", "画像フォルダ",
     ]
     with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
@@ -138,7 +141,9 @@ def append_listing_csv(item, csv_path="listings.csv"):
             "JANコード": item["jan"],
             "仕入れ価格(税込)": item["price"],
             "カテゴリ": item["category_name"],
+            "元箱": item["original_box"],
             "特記事項": item["note"],
+            "欠品情報": item["missing_items"],
             "フジヤURL": item["url"],
             "eBayタイトル": "",
             "eBay価格": "",
