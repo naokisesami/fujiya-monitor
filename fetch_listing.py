@@ -6,10 +6,6 @@
   - output/<商品コード>/ に写真を保存
   - listings.csv に1行追加（eBayタイトル・価格は空欄のまま）
 する。
-
-使い方:
-  python fetch_listing.py "https://www.fujiya-avic.co.jp/shop/g/g240001179986/"
-  もしくは環境変数 FUJIYA_URL に指定して実行（GitHub Actionsから利用する場合）
 """
 
 import csv
@@ -34,7 +30,6 @@ HEADERS = {
 IMG_RE = re.compile(r'/img/goods/[^"\'\s]+?\.(?:jpg|jpeg|png)', re.I)
 JAN_RE = re.compile(r'JAN[コードCode]{0,4}\s*[:：]?\s*\n?\s*([0-9]{8,13})')
 
-# コンディション比較テーブルから拾いたい項目
 CONDITION_LABELS = ("ランク", "元箱", "中古保証期間", "特記事項", "欠品情報")
 
 
@@ -49,7 +44,6 @@ def fetch_listing(url):
     html = res.text
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) 埋め込みの構造化データ（商品名・ブランド・価格・カテゴリ）
     data = {}
     meta_tag = soup.find("meta", attrs={"name": "etm:goods_detail"})
     print(f"  [debug] goods_detail metaタグ検出: {bool(meta_tag)}")
@@ -61,7 +55,6 @@ def fetch_listing(url):
 
     goods_code = data.get("item_code") or extract_goods_code(url)
 
-    # 2) コンディション比較テーブル（ランク・元箱・特記事項・欠品情報など）
     condition = {}
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
@@ -73,23 +66,49 @@ def fetch_listing(url):
                     condition[label] = value
     print(f"  [debug] コンディション表から取得した項目: {list(condition.keys())}")
 
-    # 3) JANコード（ページ全文テキストから）
+    rank = condition.get("ランク")
+
     page_text = soup.get_text("\n")
     jan = None
     jm = JAN_RE.search(page_text)
     if jm:
         jan = jm.group(1)
 
-    # 4) 画像URL収集（メイン画像・詳細画像。重複除去して順序維持）
+    # 商品名・ブランド（metaタグが取れなかった場合、meta descriptionから補完）
+    name = data.get("name")
+    brand = data.get("brand_name")
+    if not name or not brand:
+        desc_tag = soup.find("meta", attrs={"name": "description"})
+        desc = desc_tag["content"] if desc_tag and desc_tag.get("content") else ""
+        dm = re.match(r'^(.*?)［.*?］\s*(.*)$', desc)
+        if dm:
+            desc_brand = dm.group(1).strip()
+            rest = dm.group(2)
+            if rank and f"{rank}ランク" in rest:
+                desc_name = rest.split(f"{rank}ランク")[0].strip()
+            else:
+                desc_name = rest.split("ランク")[0].strip()
+            brand = brand or desc_brand
+            name = name or desc_name
+    print(f"  [debug] 商品名: {name} / ブランド: {brand}")
+
+    # 価格（metaタグが取れなかった場合、ページ内の￥表記から補完）
+    price = data.get("price")
+    if not price:
+        pm = re.search(r'￥\s*([\d,]{3,})', page_text)
+        if pm:
+            price = pm.group(1).replace(",", "")
+    print(f"  [debug] 価格: {price}")
+
     img_paths = list(dict.fromkeys(IMG_RE.findall(html)))
     image_urls = [f"https://www.fujiya-avic.co.jp{p}" for p in img_paths]
 
     return {
         "goods_code": goods_code,
-        "name": data.get("name"),
-        "brand": data.get("brand_name"),
-        "price": data.get("price"),
-        "rank": condition.get("ランク"),
+        "name": name,
+        "brand": brand,
+        "price": price,
+        "rank": rank,
         "jan": jan,
         "original_box": condition.get("元箱"),
         "note": condition.get("特記事項"),
