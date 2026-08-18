@@ -2,7 +2,6 @@ name: Fujiya Avic Stock Monitor
 
 on:
   schedule:
-    # UTC基準。30分ごとに実行（日本時間とは9時間ずれます）
     - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
